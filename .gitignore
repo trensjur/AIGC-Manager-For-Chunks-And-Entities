@@ -38,3 +38,10 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+### Local requirement documents (not part of the published mod) ###
+/开发要求.txt
+/要求补充-*.txt
+
+### Local decompiled stubs ###
+/net/
