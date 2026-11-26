@@ -11,7 +11,6 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobCategory;
 
 /**
@@ -19,8 +18,13 @@ import net.minecraft.world.entity.MobCategory;
  * <p>
  * The list is built once from the entity type registry, sorted by the
  * translated name and used by the chunk claim entity control page. It contains
- * every registered type that is a {@link Mob} and not a technical entity
- * ({@link MobCategory#MISC}), so modded mobs show up automatically.
+ * every registered type that is not a technical entity
+ * ({@link MobCategory#MISC}) and not the player type, so modded mobs show up
+ * automatically.
+ * <p>
+ * Note: {@code EntityType#getBaseClass()} always returns {@code Entity.class}
+ * in 1.21.1, so it cannot be used to tell mobs apart; the mob category is the
+ * reliable registry side check.
  */
 @SuppressWarnings("null")
 public final class EntityRuleCatalog {
@@ -82,10 +86,6 @@ public final class EntityRuleCatalog {
         List<Entry> list = new ArrayList<>();
         for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
             if (type == null || type == EntityType.PLAYER || type.getCategory() == MobCategory.MISC) {
-                continue;
-            }
-            Class<? extends net.minecraft.world.entity.Entity> baseClass = type.getBaseClass();
-            if (baseClass == null || !Mob.class.isAssignableFrom(baseClass)) {
                 continue;
             }
             ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(type);

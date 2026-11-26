@@ -38,7 +38,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
@@ -389,10 +389,7 @@ public final class ServerClaimManager {
                 continue;
             }
             EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(id);
-            Class<? extends net.minecraft.world.entity.Entity> baseClass = type == null ? null
-                    : type.getBaseClass();
-            if (type == null || type == EntityType.PLAYER || baseClass == null
-                    || !Mob.class.isAssignableFrom(baseClass)) {
+            if (type == null || type == EntityType.PLAYER || type.getCategory() == MobCategory.MISC) {
                 continue;
             }
             kept.add(rule);

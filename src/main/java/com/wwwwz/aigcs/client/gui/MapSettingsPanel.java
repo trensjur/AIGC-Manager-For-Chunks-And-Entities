@@ -181,8 +181,8 @@ public final class MapSettingsPanel {
                 || this.page == MapSettingsPage.CLAIM_ENTITY_RULES) {
             // Both claim pages are fixed two column layouts: the list takes the
             // left two thirds of the window, the action buttons the right
-            // third. They do not scroll as a whole, the lists are paginated.
-            this.scroll = 0.0D;
+            // third. The list is paginated, the action column scrolls when it
+            // is taller than the window (small GUI scale).
             this.scrollTop = this.contentTop;
             this.maxScroll = 0.0D;
             this.contentHeight = this.contentBottom - this.scrollTop;
@@ -886,7 +886,8 @@ public final class MapSettingsPanel {
                         rows.size()));
 
         // ------------------------------------------------------ right column
-        int rightY = this.contentTop;
+        int rightStart = this.contentTop - (int) Math.round(this.scroll);
+        int rightY = rightStart;
         this.headingAt(rightX, rightY,
                 Component.translatable("screen.m4cne.section.claims_rule_actions"));
         rightY += 15;
@@ -969,6 +970,7 @@ public final class MapSettingsPanel {
         this.labelAt(rightX, this.contentBottom - 13,
                 Component.translatable("screen.m4cne.claims.rule.summary", ruleOwnerCount(rows),
                         ruleGroupCount(rows), rows.size(), this.claimRuleSelection.size()));
+        this.finishFixedPage(rightStart, rightY);
     }
 
     /** Every rule of every owner (own rules first) as a flat list. */
@@ -1487,7 +1489,8 @@ public final class MapSettingsPanel {
                         list.size()));
 
         // ------------------------------------------------------ right column
-        int rightY = this.contentTop;
+        int rightStart = this.contentTop - (int) Math.round(this.scroll);
+        int rightY = rightStart;
         this.headingAt(rightX, rightY, Component.translatable("screen.m4cne.section.claims_chunk_actions"));
         rightY += 15;
         List<ClaimStore.Entry> selected = this.selectedChunkEntries();
@@ -1615,6 +1618,7 @@ public final class MapSettingsPanel {
         this.labelAt(rightX, this.contentBottom - 13,
                 Component.translatable("screen.m4cne.claims.chunk.summary", claimedCount, forceCount,
                         this.chunkSelection.size()));
+        this.finishFixedPage(rightStart, rightY);
     }
 
     /** One row label of the chunk list: marker, id, player and chunk centre. */
@@ -2447,11 +2451,17 @@ public final class MapSettingsPanel {
 
     /** Heading at an absolute position, used by the fixed two column pages. */
     private void headingAt(int xPos, int yPos, Component text) {
+        if (!this.isVisible(yPos, 11)) {
+            return;
+        }
         this.headings.add(new Heading(text.copy().withStyle(ChatFormatting.GOLD), yPos, xPos));
     }
 
     /** Label at an absolute position, used by the fixed two column pages. */
     private void labelAt(int xPos, int yPos, Component text) {
+        if (!this.isVisible(yPos, 11)) {
+            return;
+        }
         this.lines.add(new LabelLine(text.copy().withStyle(ChatFormatting.GRAY), yPos, 0xFFA0A0A0,
                 xPos));
     }
@@ -2459,12 +2469,33 @@ public final class MapSettingsPanel {
     /** Button with an explicit position, used by the fixed two column pages. */
     private void addButtonAt(Component label, int widgetX, int widgetY, int widgetWidth, boolean enabled,
             Runnable action, String tooltipKey) {
+        if (!this.isVisible(widgetY, ENTRY_HEIGHT)) {
+            return;
+        }
         Button button = Button.builder(label, ignored -> action.run())
                 .bounds(widgetX, widgetY, widgetWidth, ENTRY_HEIGHT)
                 .build();
         button.active = enabled;
         tip(button, tooltipKey);
         this.screen.addSidebarWidget(button);
+    }
+
+    /**
+     * Finishes one fixed two column page: the right hand action column may be
+     * taller than the window (small GUI scale, many buttons), so its height is
+     * turned into the scroll range of the page. The left list is paginated and
+     * stays fixed while the wheel scrolls the action column.
+     */
+    private void finishFixedPage(int startY, int endY) {
+        // Reserve the room of the fixed summary label at the bottom.
+        int visible = Math.max(1, this.contentBottom - this.contentTop - 16);
+        this.contentHeight = Math.max(1, endY - startY);
+        this.maxScroll = Math.max(0.0D, this.contentHeight - visible);
+        if (this.scroll > this.maxScroll) {
+            // The widgets of this frame were placed with the old offset; the
+            // next rebuild uses the corrected scroll value.
+            this.scroll = this.maxScroll;
+        }
     }
 
     private boolean isVisible(int widgetY, int widgetHeight) {
