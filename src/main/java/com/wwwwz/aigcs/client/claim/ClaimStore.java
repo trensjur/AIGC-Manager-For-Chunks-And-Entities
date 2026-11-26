@@ -10,6 +10,7 @@ import java.util.Set;
 
 import com.wwwwz.aigcs.core.claim.ClaimChunk;
 import com.wwwwz.aigcs.core.claim.ClaimOwner;
+import com.wwwwz.aigcs.core.claim.ClaimRuleGroup;
 import com.wwwwz.aigcs.core.claim.EntityRuleSet;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -115,7 +116,8 @@ public final class ClaimStore {
         private String name;
         private int color = 0xFFFFFF;
         private boolean boundary = true;
-        private EntityRuleSet entityRules = EntityRuleSet.DEFAULT;
+        /** Entity rules keyed by chunk id (claim group). */
+        private final Map<String, EntityRuleSet> groupRules = new LinkedHashMap<>();
         private final Map<String, Long2ObjectMap<Claim>> chunks = new LinkedHashMap<>();
 
         private Owner(String id, String name) {
@@ -139,9 +141,37 @@ public final class ClaimStore {
             return this.boundary;
         }
 
-        /** Entity control rules of this owner, never {@code null}. */
-        public EntityRuleSet entityRules() {
-            return this.entityRules;
+        /** Rules of one claim group, never {@code null}. */
+        public EntityRuleSet rulesFor(String groupId) {
+            if (groupId == null) {
+                return EntityRuleSet.EMPTY;
+            }
+            EntityRuleSet rules = this.groupRules.get(groupId);
+            return rules == null ? EntityRuleSet.EMPTY : rules;
+        }
+
+        /** All rule groups of this owner, keyed by chunk id. */
+        public Map<String, EntityRuleSet> groupRules() {
+            return new LinkedHashMap<>(this.groupRules);
+        }
+
+        /** True when the given chunk id owns at least one chunk. */
+        public boolean hasGroup(String groupId) {
+            if (groupId == null) {
+                return false;
+            }
+            for (Long2ObjectMap<Claim> map : this.chunks.values()) {
+                for (Long2ObjectMap.Entry<Claim> entry : map.long2ObjectEntrySet()) {
+                    long key = entry.getLongKey();
+                    String id = entry.getValue().id == null || entry.getValue().id.isBlank()
+                            ? ClaimChunk.defaultId(ChunkPos.getX(key), ChunkPos.getZ(key))
+                            : entry.getValue().id;
+                    if (id.equals(groupId)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         public int count() {
@@ -428,17 +458,36 @@ public final class ClaimStore {
             return 0;
         }
         int renamed = 0;
+        Set<String> oldIds = new LinkedHashSet<>();
+        String newId = null;
         for (long key : keys) {
             Claim claim = self.get(dimension, key);
             if (claim == null) {
                 continue;
             }
-            self.put(dimension, key, claim.forceLoad,
-                    ClaimChunk.sanitizeId(id, ChunkPos.getX(key), ChunkPos.getZ(key)), claim.boundary,
-                    claim.enterMessage, true);
+            String oldId = claim.id == null || claim.id.isBlank()
+                    ? ClaimChunk.defaultId(ChunkPos.getX(key), ChunkPos.getZ(key))
+                    : claim.id;
+            oldIds.add(oldId);
+            newId = ClaimChunk.sanitizeId(id, ChunkPos.getX(key), ChunkPos.getZ(key));
+            self.put(dimension, key, claim.forceLoad, newId, claim.boundary, claim.enterMessage,
+                    true);
             renamed++;
         }
-        if (renamed > 0) {
+        if (renamed > 0 && newId != null) {
+            // The rules of the renamed group follow the new id when the old id
+            // no longer owns any chunk.
+            EntityRuleSet inherited = self.groupRules.get(newId);
+            for (String old : oldIds) {
+                EntityRuleSet removed = self.groupRules.remove(old);
+                if (inherited == null) {
+                    inherited = removed;
+                }
+            }
+            if (inherited != null && !inherited.isEmpty()) {
+                self.groupRules.put(newId, inherited);
+            }
+            pruneGroupRules(self);
             this.editVersion++;
             this.settle();
         }
@@ -518,17 +567,31 @@ public final class ClaimStore {
             return null;
         }
         int changed = 0;
+        Set<String> oldIds = new LinkedHashSet<>();
         for (long key : keys) {
             Claim claim = self.get(dimension, key);
             if (claim == null) {
                 continue;
             }
+            oldIds.add(claim.id == null || claim.id.isBlank()
+                    ? ClaimChunk.defaultId(ChunkPos.getX(key), ChunkPos.getZ(key))
+                    : claim.id);
             if (!merged.equals(claim.id)) {
                 changed++;
             }
             self.put(dimension, key, claim.forceLoad, merged, claim.boundary, claim.enterMessage, true);
         }
         if (changed > 0) {
+            // Only the rules of the lexicographically smallest id survive the
+            // merge (要求补充-15 item 7).
+            EntityRuleSet inherited = self.groupRules.get(merged);
+            for (String old : oldIds) {
+                self.groupRules.remove(old);
+            }
+            if (inherited != null && !inherited.isEmpty()) {
+                self.groupRules.put(merged, inherited);
+            }
+            pruneGroupRules(self);
             this.editVersion++;
             this.settle();
         }
@@ -587,11 +650,11 @@ public final class ClaimStore {
     }
 
     /**
-     * Local preview of the entity control rules; the server confirms them with
-     * the next authoritative list.
+     * Local preview of the entity rules of one claim group; the server confirms
+     * them with the next authoritative list.
      */
-    public synchronized void setOwnerRules(String ownerId, EntityRuleSet rules) {
-        if (ownerId == null || rules == null) {
+    public synchronized void setGroupRules(String ownerId, String groupId, EntityRuleSet rules) {
+        if (ownerId == null || groupId == null || groupId.isBlank()) {
             return;
         }
         Owner owner = this.owners.get(ownerId);
@@ -601,8 +664,16 @@ public final class ClaimStore {
         if (owner == null) {
             return;
         }
-        owner.entityRules = rules;
+        setGroupRules(owner, groupId, rules);
         this.version++;
+    }
+
+    private static void setGroupRules(Owner owner, String groupId, EntityRuleSet rules) {
+        if (rules == null || rules.isEmpty()) {
+            owner.groupRules.remove(groupId);
+        } else {
+            owner.groupRules.put(groupId, rules);
+        }
     }
 
     /**
@@ -669,7 +740,12 @@ public final class ClaimStore {
             Owner owner = new Owner(data.id(), data.name() == null ? "?" : data.name());
             owner.color = data.color() & 0xFFFFFF;
             owner.boundary = data.boundary();
-            owner.entityRules = data.entityRules() == null ? EntityRuleSet.DEFAULT : data.entityRules();
+            for (ClaimRuleGroup group : data.ruleGroups()) {
+                if (group == null || group.id().isBlank() || group.rules().isEmpty()) {
+                    continue;
+                }
+                owner.groupRules.put(group.id(), group.rules());
+            }
             for (ClaimChunk chunk : data.chunks()) {
                 String dimension = chunk.dimension();
                 if (dimension == null) {
@@ -688,8 +764,8 @@ public final class ClaimStore {
             if (self == null) {
                 self = new Owner(previousSelf.id, previousSelf.name);
                 self.color = previousSelf.color;
-                self.entityRules = previousSelf.entityRules;
                 self.boundary = previousSelf.boundary;
+                self.groupRules.putAll(previousSelf.groupRules);
                 next.put(self.id, self);
             }
             for (Map.Entry<String, Long2ObjectMap<Claim>> entry : previousSelf.chunks.entrySet()) {
@@ -753,6 +829,23 @@ public final class ClaimStore {
     private void settle() {
         this.rebuildIndex();
         this.version++;
+    }
+
+    /** Removes rules of groups that no longer own any chunk. */
+    private static void pruneGroupRules(Owner owner) {
+        if (owner.groupRules.isEmpty()) {
+            return;
+        }
+        Set<String> used = new LinkedHashSet<>();
+        for (Long2ObjectMap<Claim> map : owner.chunks.values()) {
+            for (Long2ObjectMap.Entry<Claim> entry : map.long2ObjectEntrySet()) {
+                long key = entry.getLongKey();
+                used.add(entry.getValue().id == null || entry.getValue().id.isBlank()
+                        ? ClaimChunk.defaultId(ChunkPos.getX(key), ChunkPos.getZ(key))
+                        : entry.getValue().id);
+            }
+        }
+        owner.groupRules.keySet().removeIf(id -> !used.contains(id));
     }
 
     private void rebuildIndex() {

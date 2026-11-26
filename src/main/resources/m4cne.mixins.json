@@ -2,7 +2,11 @@
   "required": true,
   "package": "com.wwwwz.aigcs.mixin",
   "compatibilityLevel": "JAVA_21",
-  "mixins": [],
+  "mixins": [
+    "GroundPathNavigationMixin",
+    "PathNavigationAccessor",
+    "PathNavigationMixin"
+  ],
   "client": [
     "LevelChunkMixin"
   ],

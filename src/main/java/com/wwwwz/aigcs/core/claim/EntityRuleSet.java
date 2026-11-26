@@ -4,34 +4,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Entity control settings of one claim owner.
+ * The entity rules of one claimed chunk group.
  * <p>
- * The owner wide flags are applied to every claimed chunk:
- * <ul>
- * <li>{@code enabled} switches the whole feature off; nothing is blocked or
- * cleaned while it is {@code false}</li>
- * <li>{@code allowSpawn} allows new living entities inside the claimed
- * chunks</li>
- * <li>{@code allowAggro} allows mobs to target the owner while the owner stands
- * inside their own claim</li>
- * <li>{@code allowEnter} / {@code allowLeave} allow living entities to cross
- * the claim boundary</li>
- * <li>{@code forceLoadAllowSpawn} applies to force loaded chunks only: such a
- * chunk may additionally refuse all spawns</li>
- * </ul>
- * The per type {@link EntityRule} list overrides the spawn / aggro behaviour
- * and limits the population of a single type inside one chunk. Every rule with
- * a {@code maxCount > 0} is one entry of the mob population limit list: while
- * the chunk holds that many entities of the type every further spawn is
- * refused and the excess entities are removed automatically.
+ * A group is the set of chunks that share one chunk id (see
+ * {@link ClaimChunk#displayId()}); merging chunks therefore merges their rule
+ * groups as well. Only the rules of the lexicographically smallest id survive a
+ * merge (要求补充-15 item 7).
+ * <p>
+ * Every rule is independent: it carries its own enabled / spawn / isolation /
+ * aggro flags and its own buff list, and the server only applies rules that are
+ * enabled.
  */
-public record EntityRuleSet(boolean enabled, boolean allowSpawn, boolean allowAggro, boolean allowEnter,
-        boolean allowLeave, boolean forceLoadAllowSpawn, List<EntityRule> rules) {
-    /** Hard cap of stored rules per owner, also used by the network codec. */
+public record EntityRuleSet(List<EntityRule> rules) {
+    /** Hard cap of stored rules per group, also used by the network codec. */
     public static final int MAX_RULES = 256;
 
-    public static final EntityRuleSet DEFAULT = new EntityRuleSet(false, true, true, true, true, true,
-            List.of());
+    /** Empty rule set; used for groups without any rule. */
+    public static final EntityRuleSet EMPTY = new EntityRuleSet(List.of());
 
     public EntityRuleSet {
         rules = rules == null ? List.of() : List.copyOf(rules);
@@ -72,8 +61,7 @@ public record EntityRuleSet(boolean enabled, boolean allowSpawn, boolean allowAg
         if (!replaced && next.size() < MAX_RULES) {
             next.add(rule);
         }
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, this.allowEnter,
-                this.allowLeave, this.forceLoadAllowSpawn, next);
+        return new EntityRuleSet(next);
     }
 
     public EntityRuleSet withoutRule(String type) {
@@ -86,14 +74,10 @@ public record EntityRuleSet(boolean enabled, boolean allowSpawn, boolean allowAg
                 next.add(existing);
             }
         }
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, this.allowEnter,
-                this.allowLeave, this.forceLoadAllowSpawn, next);
+        return new EntityRuleSet(next);
     }
 
-    /**
-     * Every rule that takes part in the mob population limit list, i.e. every
-     * rule with a {@code maxCount} greater than zero.
-     */
+    /** Every rule with a positive population limit. */
     public List<EntityRule> limitedRules() {
         List<EntityRule> limited = new ArrayList<>(this.rules.size());
         for (EntityRule rule : this.rules) {
@@ -104,51 +88,29 @@ public record EntityRuleSet(boolean enabled, boolean allowSpawn, boolean allowAg
         return limited;
     }
 
+    /** Every enabled rule, i.e. every rule the server actually applies. */
+    public List<EntityRule> enabledRules() {
+        List<EntityRule> active = new ArrayList<>(this.rules.size());
+        for (EntityRule rule : this.rules) {
+            if (rule.enabled()) {
+                active.add(rule);
+            }
+        }
+        return active;
+    }
+
     /**
      * Adds or updates the population limit of one entity type. The remaining
-     * spawn / aggro flags are kept; a limit of {@code 0} removes the limit only.
+     * flags are kept; a limit of {@code 0} removes the limit only.
      */
     public EntityRuleSet withLimit(String type, int maxCount) {
-        EntityRule existing = this.rule(type);
-        EntityRule next = existing == null
-                ? new EntityRule(type, maxCount, true, true)
-                : existing.withMaxCount(maxCount);
-        // A rule that neither blocks spawns nor limits the population and does
-        // not change aggression is dropped instead of piling up empty entries.
-        if (next.maxCount() <= 0 && next.allowSpawn() && next.allowAggro()) {
+        EntityRule next = this.rule(type) == null ? EntityRule.defaults(type) : this.rule(type);
+        next = next.withMaxCount(maxCount);
+        if (!next.hasLimit() && next.allowNaturalSpawn() && next.allowUnnaturalSpawn()
+                && next.allowAggro() && !next.hasBuffs() && !next.isolated()) {
             return this.withoutRule(type);
         }
         return this.withRule(next);
-    }
-
-    public EntityRuleSet withEnabled(boolean value) {
-        return new EntityRuleSet(value, this.allowSpawn, this.allowAggro, this.allowEnter, this.allowLeave,
-                this.forceLoadAllowSpawn, this.rules);
-    }
-
-    public EntityRuleSet withAllowSpawn(boolean value) {
-        return new EntityRuleSet(this.enabled, value, this.allowAggro, this.allowEnter, this.allowLeave,
-                this.forceLoadAllowSpawn, this.rules);
-    }
-
-    public EntityRuleSet withAllowAggro(boolean value) {
-        return new EntityRuleSet(this.enabled, this.allowSpawn, value, this.allowEnter, this.allowLeave,
-                this.forceLoadAllowSpawn, this.rules);
-    }
-
-    public EntityRuleSet withAllowEnter(boolean value) {
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, value, this.allowLeave,
-                this.forceLoadAllowSpawn, this.rules);
-    }
-
-    public EntityRuleSet withAllowLeave(boolean value) {
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, this.allowEnter, value,
-                this.forceLoadAllowSpawn, this.rules);
-    }
-
-    public EntityRuleSet withForceLoadAllowSpawn(boolean value) {
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, this.allowEnter,
-                this.allowLeave, value, this.rules);
     }
 
     /**
@@ -173,12 +135,10 @@ public record EntityRuleSet(boolean enabled, boolean allowSpawn, boolean allowAg
                 next.add(rule);
             }
         }
-        return new EntityRuleSet(this.enabled, this.allowSpawn, this.allowAggro, this.allowEnter,
-                this.allowLeave, this.forceLoadAllowSpawn, next);
+        return new EntityRuleSet(next);
     }
 
-    /** True when the rule set cannot influence any chunk at all. */
-    public boolean inert() {
-        return !this.enabled;
+    public boolean isEmpty() {
+        return this.rules.isEmpty();
     }
 }

@@ -8,7 +8,7 @@ import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 @SuppressWarnings("null")
 public final class ModNetwork {
         /** Bump whenever the payload layout changes. */
-        public static final String PROTOCOL_VERSION = "11";
+        public static final String PROTOCOL_VERSION = "12";
 
         private ModNetwork() {
         }

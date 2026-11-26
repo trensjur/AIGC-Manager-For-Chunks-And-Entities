@@ -3,9 +3,7 @@ package com.wwwwz.aigcs.client.gui;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.IntConsumer;
 import java.util.function.Supplier;
 
 import com.wwwwz.aigcs.client.ClientConfig;
@@ -82,8 +80,6 @@ public final class MapSettingsPanel {
     private static final int ENTRY_GAP = 2;
     private static final int HEADER_HEIGHT = 32;
     private static final int FOOTER_HEIGHT = 18;
-    /** Mob buttons per page of the entity rule quick list. */
-    private static final int ENTITY_RULE_PAGE_SIZE = 10;
     /** How long the cancel button stays armed for the second confirmation. */
     private static final long CANCEL_CONFIRM_MS = 4000L;
     /** Change callback for settings that do not affect the baked map colours. */
@@ -130,18 +126,10 @@ public final class MapSettingsPanel {
     private int claimListTab;
     private int claimListPage;
     private int claimForcePage;
-    /** Free text filter of the entity rule quick list. */
-    private String entityRuleFilter = "";
-    /** Page of the entity rule quick list. */
-    private int entityRulePage;
-    /** Entity type whose rule row is expanded on the entity control page. */
-    private String expandedEntityRule = "";
-    /** Free text filter of the population limit quick list. */
-    private String limitRuleFilter = "";
-    /** Page of the population limit quick list. */
-    private int limitRulePage;
-    /** Entity type whose population limit row is expanded. */
-    private String expandedLimitRule = "";
+    /** Selection of the entity rule list, keyed by owner + group + entity type. */
+    private final java.util.LinkedHashSet<String> claimRuleSelection = new java.util.LinkedHashSet<>();
+    /** Page of the entity rule list. */
+    private int claimRulePage;
     /** Free text filter of the structure scan page. */
     private String structureQuery = "";
     /** Scan interval typed by an administrator on the claim page. */
@@ -189,15 +177,20 @@ public final class MapSettingsPanel {
         this.headings.clear();
         this.lines.clear();
         this.lockedTooltipKey = null;
-        if (this.page == MapSettingsPage.CLAIM_CHUNKS) {
-            // The chunk list is a fixed two column page: the list takes the
+        if (this.page == MapSettingsPage.CLAIM_CHUNKS
+                || this.page == MapSettingsPage.CLAIM_ENTITY_RULES) {
+            // Both claim pages are fixed two column layouts: the list takes the
             // left two thirds of the window, the action buttons the right
-            // third. It does not scroll as a whole, the lists are paginated.
+            // third. They do not scroll as a whole, the lists are paginated.
             this.scroll = 0.0D;
             this.scrollTop = this.contentTop;
             this.maxScroll = 0.0D;
             this.contentHeight = this.contentBottom - this.scrollTop;
-            this.buildClaimChunksPage();
+            if (this.page == MapSettingsPage.CLAIM_CHUNKS) {
+                this.buildClaimChunksPage();
+            } else {
+                this.buildClaimRulesPage();
+            }
             return;
         }
         int entryWidth = this.width - 12;
@@ -235,7 +228,12 @@ public final class MapSettingsPanel {
                 case WAYPOINT_TRASH -> this.buildWaypointTrash(entryWidth);
                 case STRUCTURE_SCAN -> this.buildStructureScan(entryWidth);
                 case CLAIMS -> this.buildClaims(entryWidth);
-                case CLAIM_ENTITY_RULES -> this.buildClaimEntityRules(entryWidth);
+                case CLAIM_CHUNKS -> {
+                    // handled by the fixed two column branch above
+                }
+                case CLAIM_ENTITY_RULES -> {
+                    // handled by the fixed two column branch above
+                }
                 case PRELOAD -> this.buildPreload(entryWidth);
                 case OVERLAYS -> this.buildOverlays(entryWidth);
                 case MINIMAP_HUD -> this.buildMinimapHud(entryWidth);
@@ -807,170 +805,345 @@ public final class MapSettingsPanel {
         }
     }
 
-    /**
-     * Entity control page of the chunk claim management.
-     * <p>
-     * The owner wide switches decide whether the feature is active at all, which
-     * spawns, aggression and boundary crossings are allowed for the claimed
-     * chunks, and whether force loaded chunks may spawn mobs. Below them the
-     * population limit list keeps one editable rule per mob type (the old single
-     * force load cap); the per mob rule list then exposes the spawn / aggro
-     * flags of every rule and the quick list adds any mob the game knows about.
-     */
-    private void buildClaimEntityRules(int entryWidth) {
-        ClaimStore store = ClaimStore.get();
-        ClaimSyncManager sync = ClaimSyncManager.get();
-        if (!sync.isAdmin()) {
-            // Ordinary players only edit their own rules; the player list
-            // selection is an administrator tool.
-            this.selectedClaimOwnerId = store.selfId();
-        }
-        ClaimStore.Owner target = this.entityRuleTarget();
-        if (target == null) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_no_target"));
-            return;
-        }
-        boolean mayEdit = sync.isAdmin() || target.id().equals(store.selfId());
-        if (!mayEdit) {
-            this.lockedTooltipKey = "screen.m4cne.claims.entity_no_permission";
-        }
-        if (!sync.entityControlSupported()) {
-            this.lockedTooltipKey = "screen.m4cne.claims.entity_disabled.tooltip";
-        }
-        EntityRuleSet rules = target.entityRules();
-
-        this.section("screen.m4cne.section.claims_entity_target");
-        this.label(Component.translatable("screen.m4cne.claims.entity_target", target.name(),
-                rules.rules().size()));
-        if (!sync.entityControlSupported()) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_disabled"));
-        }
-        if (sync.isAdmin()) {
-            this.addButton(Component.translatable("screen.m4cne.claims.entity_switch_target"), entryWidth,
-                    () -> this.cycleEntityRuleTarget(),
-                    "screen.m4cne.claims.entity_switch_target.tooltip");
-        }
-        if (!sync.supported()) {
-            this.label(Component.translatable("screen.m4cne.claims.unsupported"));
-        } else if (!sync.available()) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_waiting"));
+    /** One row of the entity rule list: owner, claim group and the rule itself. */
+    private record RuleRow(ClaimStore.Owner owner, String groupId, EntityRule rule, int chunkCount) {
+        private String key() {
+            return key(this.owner.id(), this.groupId, this.rule.type());
         }
 
-        this.section("screen.m4cne.section.claims_entity_global");
-        this.ruleToggle("screen.m4cne.claims.entity_enabled", rules.enabled(),
-                value -> this.applyEntityRules(target, rules.withEnabled(value)), entryWidth);
-        this.ruleToggle("screen.m4cne.claims.entity_allow_spawn", rules.allowSpawn(),
-                value -> this.applyEntityRules(target, rules.withAllowSpawn(value)), entryWidth);
-        this.ruleToggle("screen.m4cne.claims.entity_allow_aggro", rules.allowAggro(),
-                value -> this.applyEntityRules(target, rules.withAllowAggro(value)), entryWidth);
-        this.ruleToggle("screen.m4cne.claims.entity_allow_enter", rules.allowEnter(),
-                value -> this.applyEntityRules(target, rules.withAllowEnter(value)), entryWidth);
-        this.ruleToggle("screen.m4cne.claims.entity_allow_leave", rules.allowLeave(),
-                value -> this.applyEntityRules(target, rules.withAllowLeave(value)), entryWidth);
-
-        this.section("screen.m4cne.section.claims_entity_force");
-        this.label(Component.translatable("screen.m4cne.claims.entity_force_hint"));
-        this.ruleToggle("screen.m4cne.claims.entity_force_spawn", rules.forceLoadAllowSpawn(),
-                value -> this.applyEntityRules(target, rules.withForceLoadAllowSpawn(value)), entryWidth);
-
-        // Population limit list: one rule per mob type, e.g. minecraft:zombie
-        // with a limit of 3 keeps at most three zombies inside every claimed
-        // chunk and closes the spawn mechanism of the chunk while it is full.
-        this.section("screen.m4cne.section.claims_entity_limits");
-        this.label(Component.translatable("screen.m4cne.claims.entity_limits_hint"));
-        List<EntityRule> limited = rules.limitedRules();
-        if (limited.isEmpty()) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_limits_empty"));
+        private static String key(String ownerId, String groupId, String type) {
+            return ownerId + "#" + groupId + "#" + type;
         }
-        for (EntityRule rule : limited) {
-            boolean expanded = rule.type().equals(this.expandedLimitRule);
-            Component name = entityName(rule.type());
-            Component row = Component.empty()
-                    .append(Component.literal(expanded ? "\u25BC " : "\u25B6 ")
-                            .withStyle(ChatFormatting.GRAY))
-                    .append(name)
-                    .append(Component.literal("  " + rule.type()).withStyle(ChatFormatting.DARK_GRAY))
-                    .append(Component.literal("  \u2264 " + rule.maxCount())
-                            .withStyle(ChatFormatting.GOLD));
-            this.selectRow(entryWidth, row,
-                    Component.translatable("screen.m4cne.claims.entity_limit_row_tooltip", name,
-                            rule.maxCount()),
-                    () -> {
-                        this.expandedLimitRule = expanded ? "" : rule.type();
-                        this.screen.requestSidebarRebuild();
-                    });
-            if (!expanded) {
-                continue;
-            }
-            this.ruleNumberField("screen.m4cne.claims.entity_limit_count", 1, EntityRule.MAX_COUNT,
-                    rule.maxCount(),
-                    value -> this.applyEntityRules(target, rules.withRule(rule.withMaxCount(value))),
-                    entryWidth);
-            this.addButton(Component.translatable("screen.m4cne.claims.entity_limit_remove"), entryWidth,
-                    () -> {
-                        this.expandedLimitRule = "";
-                        this.applyEntityRules(target, rules.withLimit(rule.type(), 0));
-                    }, "screen.m4cne.claims.entity_limit_remove.tooltip");
-        }
-        this.label(Component.translatable("screen.m4cne.claims.entity_limits_add_hint"));
-        this.mobCatalog(entryWidth, true, rules, target);
+    }
 
-        this.section("screen.m4cne.section.claims_entity_rules");
-        if (rules.rules().isEmpty()) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_rules_empty"));
-        }
-        for (EntityRule rule : rules.rules()) {
-            boolean expanded = rule.type().equals(this.expandedEntityRule);
-            Component name = entityName(rule.type());
-            Component row = Component.empty()
-                    .append(Component.literal(expanded ? "\u25BC " : "\u25B6 ")
-                            .withStyle(ChatFormatting.GRAY))
-                    .append(name)
-                    .append(Component.literal("  " + rule.type()).withStyle(ChatFormatting.DARK_GRAY));
-            Component tooltip = Component.translatable("screen.m4cne.claims.entity_rule_tooltip",
-                    name,
-                    rule.maxCount() <= 0
-                            ? Component.translatable("screen.m4cne.claims.entity_unlimited")
-                            : Component.literal(Integer.toString(rule.maxCount())),
-                    state(rule.allowSpawn()), state(rule.allowAggro()));
-            this.selectRow(entryWidth, row, tooltip, () -> {
-                this.expandedEntityRule = expanded ? "" : rule.type();
-                this.screen.requestSidebarRebuild();
-            });
-            if (!expanded) {
-                continue;
-            }
-            this.ruleToggle("screen.m4cne.claims.entity_rule_allow_spawn", rule.allowSpawn(),
-                    value -> this.applyEntityRules(target, rules.withRule(rule.withAllowSpawn(value))),
-                    entryWidth);
-            this.ruleToggle("screen.m4cne.claims.entity_rule_allow_aggro", rule.allowAggro(),
-                    value -> this.applyEntityRules(target, rules.withRule(rule.withAllowAggro(value))),
-                    entryWidth);
-            this.addButton(Component.translatable("screen.m4cne.claims.entity_rule_remove"), entryWidth,
-                    () -> {
-                        this.expandedEntityRule = "";
-                        this.applyEntityRules(target, rules.withoutRule(rule.type()));
-                    }, "screen.m4cne.claims.entity_rule_remove.tooltip");
-        }
-
-        this.section("screen.m4cne.section.claims_entity_catalog");
-        this.label(Component.translatable("screen.m4cne.claims.entity_catalog_hint"));
-        this.mobCatalog(entryWidth, false, rules, target);
+    /** Target of an add / edit action: one claim group of one owner. */
+    private record RuleTarget(String ownerId, String groupId) {
     }
 
     /**
-     * Owner whose entity rules the page edits: the selected player or the local
-     * player.
+     * Entity rule page of the chunk claim management.
+     * <p>
+     * The page is a fixed two column layout (要求补充-15 item 1): the rule list
+     * takes the left two thirds of the window and shows one row per rule with
+     * the entity name, the owner of the chunks and every flag, while the right
+     * column keeps the add / edit / enable-disable / delete buttons.
+     */
+    private void buildClaimRulesPage() {
+        this.addFixedButton(Component.translatable("screen.m4cne.back"), 90, this.contentTop,
+                this::back, "screen.m4cne.back.tooltip");
+        int listX = this.x + 6;
+        int listWidth = Math.max(120, (int) Math.round((this.width - 20) * 2.0D / 3.0D));
+        int rightX = listX + listWidth + 8;
+        int rightWidth = Math.max(80, this.x + this.width - 6 - rightX);
+        int top = this.contentTop + ENTRY_HEIGHT + 8;
+
+        ClaimSyncManager sync = ClaimSyncManager.get();
+        List<RuleRow> rows = this.ruleRows();
+        java.util.Set<String> validKeys = new java.util.HashSet<>();
+        for (RuleRow row : rows) {
+            validKeys.add(row.key());
+        }
+        this.claimRuleSelection.retainAll(validKeys);
+
+        this.headingAt(listX, top, Component.translatable("screen.m4cne.section.claims_rule_list"));
+        top += 15;
+        this.labelAt(listX + 1, top, Component.translatable("screen.m4cne.claims.rule.list_hint"));
+        top += 13;
+
+        int navY = this.contentBottom - ENTRY_HEIGHT;
+        int pageSize = Math.max(1, (navY - 6 - top) / (ENTRY_HEIGHT + ENTRY_GAP));
+        int pages = Math.max(1, (rows.size() + pageSize - 1) / pageSize);
+        this.claimRulePage = Mth.clamp(this.claimRulePage, 0, pages - 1);
+        int rowY = top;
+        if (rows.isEmpty()) {
+            this.labelAt(listX + 1, rowY, Component.translatable("screen.m4cne.claims.rule.empty"));
+        }
+        int start = this.claimRulePage * pageSize;
+        int end = Math.min(rows.size(), start + pageSize);
+        for (int index = start; index < end; index++) {
+            RuleRow row = rows.get(index);
+            boolean selected = this.claimRuleSelection.contains(row.key());
+            Button button = Button.builder(ruleRowLabel(row, selected),
+                    ignored -> this.toggleRuleSelection(row))
+                    .bounds(listX, rowY, listWidth, ENTRY_HEIGHT)
+                    .build();
+            button.setTooltip(Tooltip.create(this.ruleRowTooltip(row)));
+            this.screen.addSidebarWidget(button);
+            rowY += ENTRY_HEIGHT + ENTRY_GAP;
+        }
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.prev"), listX, navY, 70,
+                this.claimRulePage > 0, () -> {
+                    this.claimRulePage = Math.max(0, this.claimRulePage - 1);
+                    this.screen.requestSidebarRebuild();
+                }, "screen.m4cne.claims.rule.prev.tooltip");
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.next"),
+                listX + listWidth - 70, navY, 70, this.claimRulePage + 1 < pages, () -> {
+                    this.claimRulePage++;
+                    this.screen.requestSidebarRebuild();
+                }, "screen.m4cne.claims.rule.next.tooltip");
+        this.labelAt(listX + 78, navY + 6,
+                Component.translatable("screen.m4cne.claims.rule.page", this.claimRulePage + 1, pages,
+                        rows.size()));
+
+        // ------------------------------------------------------ right column
+        int rightY = this.contentTop;
+        this.headingAt(rightX, rightY,
+                Component.translatable("screen.m4cne.section.claims_rule_actions"));
+        rightY += 15;
+        List<RuleRow> selected = this.selectedRuleRows(rows);
+        boolean hasSelection = !selected.isEmpty();
+        boolean editableSelection = false;
+        for (RuleRow row : selected) {
+            if (canEditRules(row.owner(), sync)) {
+                editableSelection = true;
+            }
+        }
+        boolean singleEditable = selected.size() == 1 && canEditRules(selected.get(0).owner(), sync);
+        boolean control = sync.entityControlSupported();
+        boolean canAdd = control && this.addTarget(selected) != null;
+
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.add"), rightX, rightY,
+                rightWidth, canAdd, this::addRule, "screen.m4cne.claims.rule.add.tooltip");
+        rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.edit"), rightX, rightY,
+                rightWidth, control && singleEditable, this::editSelectedRule,
+                "screen.m4cne.claims.rule.edit.tooltip");
+        rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.toggle"), rightX, rightY,
+                rightWidth, control && editableSelection, this::toggleSelectedRules,
+                "screen.m4cne.claims.rule.toggle.tooltip");
+        rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.delete"), rightX, rightY,
+                rightWidth, control && editableSelection, this::deleteSelectedRules,
+                "screen.m4cne.claims.rule.delete.tooltip");
+        rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.rule.clear"), rightX, rightY,
+                rightWidth, hasSelection, () -> {
+                    this.claimRuleSelection.clear();
+                    this.screen.requestSidebarRebuild();
+                }, "screen.m4cne.claims.rule.clear.tooltip");
+        rightY += ENTRY_HEIGHT + 6;
+
+        this.headingAt(rightX, rightY,
+                Component.translatable("screen.m4cne.section.claims_rule_target"));
+        rightY += 15;
+        ClaimStore.Owner target = this.entityRuleTarget();
+        String targetGroup = target == null ? null : this.addTargetGroup(target, selected);
+        this.labelAt(rightX, rightY,
+                Component.translatable("screen.m4cne.claims.rule.target",
+                        target == null ? "-" : target.name(), targetGroup == null ? "-" : targetGroup));
+        rightY += 13;
+        if (sync.isAdmin()) {
+            this.addButtonAt(Component.translatable("screen.m4cne.claims.entity_switch_target"),
+                    rightX, rightY, rightWidth, true, this::cycleEntityRuleTarget,
+                    "screen.m4cne.claims.entity_switch_target.tooltip");
+            rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        }
+        if (!control) {
+            this.labelAt(rightX, rightY,
+                    Component.translatable("screen.m4cne.claims.entity_disabled"));
+            rightY += 13;
+        } else if (!sync.supported()) {
+            this.labelAt(rightX, rightY, Component.translatable("screen.m4cne.claims.unsupported"));
+            rightY += 13;
+        } else if (!sync.available()) {
+            this.labelAt(rightX, rightY,
+                    Component.translatable("screen.m4cne.claims.entity_waiting"));
+            rightY += 13;
+        }
+        rightY += 4;
+
+        this.headingAt(rightX, rightY, Component.translatable("screen.m4cne.section.claims_server"));
+        rightY += 15;
+        this.addButtonAt(Component.translatable("screen.m4cne.claims.action.sync_now"), rightX, rightY,
+                rightWidth, true, this.screen::syncClaimsNow,
+                "screen.m4cne.claims.action.sync_now.tooltip");
+        rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        if (sync.isAdmin()) {
+            this.addButtonAt(Component.translatable("screen.m4cne.claims.action.scan"), rightX, rightY,
+                    rightWidth, true, this.screen::requestClaimScan,
+                    "screen.m4cne.claims.action.scan.tooltip");
+            rightY += ENTRY_HEIGHT + ENTRY_GAP;
+        }
+
+        this.labelAt(rightX, this.contentBottom - 13,
+                Component.translatable("screen.m4cne.claims.rule.summary", ruleOwnerCount(rows),
+                        ruleGroupCount(rows), rows.size(), this.claimRuleSelection.size()));
+    }
+
+    /** Every rule of every owner (own rules first) as a flat list. */
+    private List<RuleRow> ruleRows() {
+        ClaimStore store = ClaimStore.get();
+        String selfId = store.selfId();
+        List<RuleRow> rows = new ArrayList<>();
+        for (ClaimStore.Owner owner : store.sortedOwners()) {
+            if (owner.id().isEmpty()) {
+                continue;
+            }
+            java.util.Map<String, Integer> counts = new java.util.HashMap<>();
+            for (ClaimStore.Entry entry : owner.chunkEntries()) {
+                counts.merge(entry.displayId(), 1, Integer::sum);
+            }
+            for (java.util.Map.Entry<String, EntityRuleSet> group : owner.groupRules().entrySet()) {
+                int count = counts.getOrDefault(group.getKey(), 0);
+                for (EntityRule rule : group.getValue().rules()) {
+                    rows.add(new RuleRow(owner, group.getKey(), rule, count));
+                }
+            }
+        }
+        rows.sort((left, right) -> {
+            boolean leftSelf = left.owner().id().equals(selfId);
+            boolean rightSelf = right.owner().id().equals(selfId);
+            if (leftSelf != rightSelf) {
+                return leftSelf ? -1 : 1;
+            }
+            int owner = left.owner().name().compareToIgnoreCase(right.owner().name());
+            if (owner != 0) {
+                return owner;
+            }
+            int group = left.groupId().compareTo(right.groupId());
+            return group != 0 ? group : left.rule().type().compareTo(right.rule().type());
+        });
+        return rows;
+    }
+
+    private static int ruleOwnerCount(List<RuleRow> rows) {
+        java.util.Set<String> owners = new java.util.HashSet<>();
+        for (RuleRow row : rows) {
+            owners.add(row.owner().id());
+        }
+        return owners.size();
+    }
+
+    private static int ruleGroupCount(List<RuleRow> rows) {
+        java.util.Set<String> groups = new java.util.HashSet<>();
+        for (RuleRow row : rows) {
+            groups.add(RuleRow.key(row.owner().id(), row.groupId(), ""));
+        }
+        return groups.size();
+    }
+
+    private List<RuleRow> selectedRuleRows(List<RuleRow> rows) {
+        if (this.claimRuleSelection.isEmpty()) {
+            return List.of();
+        }
+        java.util.Map<String, RuleRow> byKey = new java.util.HashMap<>();
+        for (RuleRow row : rows) {
+            byKey.put(row.key(), row);
+        }
+        List<RuleRow> selected = new ArrayList<>(this.claimRuleSelection.size());
+        for (String key : this.claimRuleSelection) {
+            RuleRow row = byKey.get(key);
+            if (row != null) {
+                selected.add(row);
+            }
+        }
+        return selected;
+    }
+
+    private void toggleRuleSelection(RuleRow row) {
+        String key = row.key();
+        if (Screen.hasShiftDown() || Screen.hasControlDown()) {
+            if (!this.claimRuleSelection.remove(key)) {
+                this.claimRuleSelection.add(key);
+            }
+        } else {
+            boolean already = this.claimRuleSelection.size() == 1
+                    && this.claimRuleSelection.contains(key);
+            this.claimRuleSelection.clear();
+            if (!already) {
+                this.claimRuleSelection.add(key);
+            }
+        }
+        this.selectedClaimOwnerId = row.owner().id();
+        this.screen.requestSidebarRebuild();
+    }
+
+    private static boolean canEditRules(ClaimStore.Owner owner, ClaimSyncManager sync) {
+        return owner != null && (sync.isAdmin() || owner.id().equals(ClaimStore.get().selfId()));
+    }
+
+    /** Row label: marker, entity name, owner, group id and every flag. */
+    private Component ruleRowLabel(RuleRow row, boolean selected) {
+        return Component.empty()
+                .append(Component.literal(selected ? "\u25B6 " : "\u25CB ")
+                        .withStyle(ChatFormatting.GRAY))
+                .append(Component.literal(entityName(row.rule().type()).getString())
+                        .withStyle(row.rule().enabled() ? ChatFormatting.WHITE : ChatFormatting.DARK_GRAY))
+                .append(Component.literal(" | " + row.owner().name()).withStyle(ChatFormatting.AQUA))
+                .append(Component.literal(" | " + row.groupId())
+                        .withStyle(style -> style.withColor(row.owner().color())))
+                .append(Component.literal(" | ").withStyle(ChatFormatting.DARK_GRAY))
+                .append(ruleFlag("screen.m4cne.claims.rule.flag_natural", row.rule().allowNaturalSpawn(),
+                        ChatFormatting.GREEN))
+                .append(ruleFlag("screen.m4cne.claims.rule.flag_unnatural",
+                        row.rule().allowUnnaturalSpawn(), ChatFormatting.GREEN))
+                .append(Component.translatable("screen.m4cne.claims.rule.flag_buff",
+                        row.rule().buffs().size())
+                        .withStyle(row.rule().hasBuffs() ? ChatFormatting.LIGHT_PURPLE
+                                : ChatFormatting.DARK_GRAY))
+                .append(ruleFlag("screen.m4cne.claims.rule.flag_isolated", row.rule().isolated(),
+                        ChatFormatting.GOLD))
+                .append(ruleFlag("screen.m4cne.claims.rule.flag_aggro", row.rule().allowAggro(),
+                        ChatFormatting.RED));
+    }
+
+    private static Component ruleFlag(String key, boolean value, ChatFormatting on) {
+        ChatFormatting colour = value ? on : ChatFormatting.DARK_GRAY;
+        return Component.empty()
+                .append(Component.translatable(key).withStyle(colour))
+                .append(Component.literal(value ? "\u25CF " : "\u25CB ").withStyle(colour));
+    }
+
+    private Component ruleRowTooltip(RuleRow row) {
+        return Component.translatable("screen.m4cne.claims.rule.row_tooltip",
+                entityName(row.rule().type()), row.owner().name(), row.groupId(), row.chunkCount(),
+                state(row.rule().enabled()), state(row.rule().allowNaturalSpawn()),
+                state(row.rule().allowUnnaturalSpawn()), row.rule().buffs().size(),
+                state(row.rule().isolated()), state(row.rule().allowAggro()));
+    }
+
+    /**
+     * Owner whose rules the page edits: the selected player or the local player.
      */
     private ClaimStore.Owner entityRuleTarget() {
         ClaimStore store = ClaimStore.get();
         ClaimStore.Owner target = store.owner(this.selectedClaimOwnerId);
-        return target != null ? target : store.selfOrCreate();
+        return target != null ? target : store.self();
+    }
+
+    /** Group id an add action would use: the selected row or the first group. */
+    private String addTargetGroup(ClaimStore.Owner owner, List<RuleRow> selected) {
+        if (!selected.isEmpty() && selected.get(0).owner().id().equals(owner.id())) {
+            return selected.get(0).groupId();
+        }
+        java.util.TreeSet<String> ids = new java.util.TreeSet<>();
+        for (ClaimStore.Entry entry : owner.chunkEntries()) {
+            ids.add(entry.displayId());
+        }
+        return ids.isEmpty() ? null : ids.first();
+    }
+
+    /** Resolved target of the add button, or {@code null} when none exists. */
+    private RuleTarget addTarget(List<RuleRow> selected) {
+        ClaimSyncManager sync = ClaimSyncManager.get();
+        if (!selected.isEmpty()) {
+            RuleRow row = selected.get(0);
+            if (!canEditRules(row.owner(), sync)) {
+                return null;
+            }
+            return new RuleTarget(row.owner().id(), row.groupId());
+        }
+        ClaimStore.Owner target = this.entityRuleTarget();
+        if (target == null || !canEditRules(target, sync)) {
+            return null;
+        }
+        String group = this.addTargetGroup(target, List.of());
+        return group == null ? null : new RuleTarget(target.id(), group);
     }
 
     /**
-     * Switches the edited owner to the next player with claims (administrators
-     * only).
+     * Switches the edited owner to the next player with claims (administrators).
      */
     private void cycleEntityRuleTarget() {
         ClaimStore store = ClaimStore.get();
@@ -986,169 +1159,137 @@ public final class MapSettingsPanel {
             }
         }
         this.selectedClaimOwnerId = owners.get(next).id();
-        this.expandedEntityRule = "";
-        this.expandedLimitRule = "";
         this.screen.requestSidebarRebuild();
     }
 
-    /** Applies one rule set locally and uploads it to the server. */
-    private void applyEntityRules(ClaimStore.Owner owner, EntityRuleSet rules) {
-        if (owner == null || rules == null) {
+    /** Adds a rule with the default entity type to the target group. */
+    private void addRule() {
+        RuleTarget target = this.addTarget(this.selectedRuleRows(this.ruleRows()));
+        if (target == null) {
+            this.screen.showStatus(
+                    Component.translatable("screen.m4cne.status.claims.rule_no_group"));
             return;
         }
-        ClaimStore.get().setOwnerRules(owner.id(), rules);
-        boolean sent = ClaimSyncManager.get().setEntityRules(owner.id(), rules);
-        if (!sent) {
-            this.screen.showStatus(Component.translatable("screen.m4cne.status.claims.unavailable"));
+        ClaimStore.Owner owner = ClaimStore.get().owner(target.ownerId());
+        EntityRuleSet rules = owner == null ? EntityRuleSet.EMPTY : owner.rulesFor(target.groupId());
+        EntityRuleCatalog.Entry candidate = null;
+        for (EntityRuleCatalog.Entry entry : EntityRuleCatalog.entries()) {
+            if (!rules.has(entry.id())) {
+                candidate = entry;
+                break;
+            }
         }
+        if (candidate == null) {
+            this.screen.showStatus(
+                    Component.translatable("screen.m4cne.status.claims.rule_all_types"));
+            return;
+        }
+        EntityRule rule = EntityRule.defaults(candidate.id());
+        this.applyGroupRules(target.ownerId(), target.groupId(), rules.withRule(rule));
+        this.claimRuleSelection.clear();
+        this.claimRuleSelection.add(RuleRow.key(target.ownerId(), target.groupId(), rule.type()));
+        this.screen.showStatus(Component.translatable("screen.m4cne.status.claims.rule_added",
+                candidate.name()));
         this.screen.requestSidebarRebuild();
     }
 
-    /** On/off button bound to one entity rule flag. */
-    private void ruleToggle(String labelKey, boolean value, Consumer<Boolean> setter, int entryWidth) {
-        int widgetY = this.cursor;
-        if (this.isVisible(widgetY, ENTRY_HEIGHT)) {
-            MapToggleButton button = new MapToggleButton(
-                    this.x + 6, widgetY, entryWidth, ENTRY_HEIGHT,
-                    Component.translatable(labelKey), () -> value,
-                    next -> setter.accept(next), NO_MAP_CHANGE);
-            this.applyLock(button, labelKey + ".tooltip");
-            this.screen.addSidebarWidget(button);
+    /** Opens the editor of the single selected rule. */
+    private void editSelectedRule() {
+        List<RuleRow> selected = this.selectedRuleRows(this.ruleRows());
+        if (selected.size() != 1) {
+            this.screen.showStatus(
+                    Component.translatable("screen.m4cne.status.claims.rule_single"));
+            return;
         }
-        this.cursor += ENTRY_HEIGHT + ENTRY_GAP;
-    }
-
-    /** Numeric input bound to one entity rule field. */
-    private void ruleNumberField(String labelKey, int minimum, int maximum, int initial,
-            IntConsumer setter, int entryWidth) {
-        int widgetY = this.cursor;
-        if (this.isVisible(widgetY, ENTRY_HEIGHT)) {
-            MapNumberField field = new MapNumberField(
-                    this.x + 6, widgetY, entryWidth, ENTRY_HEIGHT,
-                    Component.translatable(labelKey), minimum, maximum, initial,
-                    setter, NO_MAP_CHANGE);
-            if (this.lockedTooltipKey != null) {
-                field.active = false;
-                tip(field, this.lockedTooltipKey);
-            } else {
-                tip(field, labelKey + ".tooltip", "screen.m4cne.input.enter_confirm");
-            }
-            this.screen.addSidebarWidget(field);
+        RuleRow row = selected.get(0);
+        if (!canEditRules(row.owner(), ClaimSyncManager.get())) {
+            this.screen.showStatus(
+                    Component.translatable("screen.m4cne.status.claims.rule_no_permission"));
+            return;
         }
-        this.cursor += ENTRY_HEIGHT + ENTRY_GAP;
-    }
-
-    /** Filter input of one mob quick list; the apply button commits the keyword. */
-    private void mobCatalogFilterField(int entryWidth, boolean limitMode) {
-        int widgetY = this.cursor;
-        if (this.isVisible(widgetY, ENTRY_HEIGHT)) {
-            EditBox field = new EditBox(Minecraft.getInstance().font, this.x + 6, widgetY, entryWidth,
-                    ENTRY_HEIGHT, Component.translatable("screen.m4cne.claims.entity_catalog_filter"));
-            field.setMaxLength(64);
-            field.setHint(Component.translatable("screen.m4cne.claims.entity_catalog_filter_hint"));
-            field.setValue(limitMode ? this.limitRuleFilter : this.entityRuleFilter);
-            field.setResponder(value -> {
-                if (limitMode) {
-                    this.limitRuleFilter = value;
-                } else {
-                    this.entityRuleFilter = value;
-                }
-            });
-            if (this.lockedTooltipKey != null) {
-                field.active = false;
-                tip(field, this.lockedTooltipKey);
-            } else {
-                tip(field, "screen.m4cne.claims.entity_catalog_filter.tooltip");
-            }
-            this.screen.addSidebarWidget(field);
-        }
-        this.cursor += ENTRY_HEIGHT + ENTRY_GAP;
+        Minecraft.getInstance().setScreen(new ClaimRuleEditScreen(this.screen, row.owner().id(),
+                row.groupId(), row.rule()));
     }
 
     /**
-     * Quick list of every registered mob, shared by the population limit list
-     * and the per mob spawn / aggro rule list.
-     * <p>
-     * In limit mode a click appends the mob to the population limit list (or
-     * raises the limit back to the default), otherwise a plain rule is added.
+     * Enables every selected rule when one of them is disabled, disables them
+     * otherwise.
      */
-    private void mobCatalog(int entryWidth, boolean limitMode, EntityRuleSet rules,
-            ClaimStore.Owner target) {
-        this.mobCatalogFilterField(entryWidth, limitMode);
-        this.addButton(Component.translatable("screen.m4cne.claims.entity_catalog_apply"), entryWidth,
-                () -> {
-                    if (limitMode) {
-                        this.limitRulePage = 0;
-                    } else {
-                        this.entityRulePage = 0;
-                    }
-                    this.screen.requestSidebarRebuild();
-                }, "screen.m4cne.claims.entity_catalog_apply.tooltip");
-        List<EntityRuleCatalog.Entry> entries = EntityRuleCatalog
-                .filtered(limitMode ? this.limitRuleFilter : this.entityRuleFilter);
-        int pages = Math.max(1,
-                (entries.size() + ENTITY_RULE_PAGE_SIZE - 1) / ENTITY_RULE_PAGE_SIZE);
-        int page = Mth.clamp(limitMode ? this.limitRulePage : this.entityRulePage, 0, pages - 1);
-        if (limitMode) {
-            this.limitRulePage = page;
-        } else {
-            this.entityRulePage = page;
+    private void toggleSelectedRules() {
+        List<RuleRow> selected = this.selectedRuleRows(this.ruleRows());
+        ClaimSyncManager sync = ClaimSyncManager.get();
+        boolean enable = false;
+        for (RuleRow row : selected) {
+            if (canEditRules(row.owner(), sync) && !row.rule().enabled()) {
+                enable = true;
+                break;
+            }
         }
-        this.label(Component.translatable("screen.m4cne.claims.entity_catalog_page", page + 1, pages,
-                entries.size()));
-        this.addButton(Component.translatable("screen.m4cne.claims.entity_catalog_prev"), entryWidth,
-                page > 0, () -> {
-                    if (limitMode) {
-                        this.limitRulePage = page - 1;
-                    } else {
-                        this.entityRulePage = page - 1;
-                    }
-                    this.screen.requestSidebarRebuild();
-                }, "screen.m4cne.claims.entity_catalog_prev.tooltip");
-        this.addButton(Component.translatable("screen.m4cne.claims.entity_catalog_next"), entryWidth,
-                page + 1 < pages, () -> {
-                    if (limitMode) {
-                        this.limitRulePage = page + 1;
-                    } else {
-                        this.entityRulePage = page + 1;
-                    }
-                    this.screen.requestSidebarRebuild();
-                }, "screen.m4cne.claims.entity_catalog_next.tooltip");
-        if (entries.isEmpty()) {
-            this.label(Component.translatable("screen.m4cne.claims.entity_catalog_empty"));
-        }
-        int start = page * ENTITY_RULE_PAGE_SIZE;
-        int end = Math.min(start + ENTITY_RULE_PAGE_SIZE, entries.size());
-        for (int index = start; index < end; index++) {
-            EntityRuleCatalog.Entry entry = entries.get(index);
-            if (limitMode) {
-                EntityRule existing = rules.rule(entry.id());
-                boolean limitedRow = existing != null && existing.hasLimit();
-                this.addButton(Component.translatable(
-                        limitedRow ? "screen.m4cne.claims.entity_limit_added"
-                                : "screen.m4cne.claims.entity_limit_add",
-                        entry.name()), entryWidth, !limitedRow, () -> {
-                            this.expandedLimitRule = entry.id();
-                            this.applyEntityRules(target,
-                                    rules.withLimit(entry.id(), EntityRule.DEFAULT_LIMIT));
-                        }, limitedRow ? "screen.m4cne.claims.entity_limit_added.tooltip"
-                                : "screen.m4cne.claims.entity_limit_add.tooltip");
+        java.util.Map<RuleTarget, EntityRuleSet> updates = new java.util.LinkedHashMap<>();
+        int changed = 0;
+        for (RuleRow row : selected) {
+            if (!canEditRules(row.owner(), sync)) {
                 continue;
             }
-            boolean added = rules.has(entry.id());
-            this.addButton(Component.translatable(
-                    added ? "screen.m4cne.claims.entity_catalog_added"
-                            : "screen.m4cne.claims.entity_catalog_add",
-                    entry.name()), entryWidth, !added, () -> {
-                        this.expandedEntityRule = entry.id();
-                        this.applyEntityRules(target,
-                                rules.withRule(EntityRule.defaults(entry.id())));
-                    }, added ? "screen.m4cne.claims.entity_catalog_added.tooltip"
-                            : "screen.m4cne.claims.entity_catalog_add.tooltip");
+            RuleTarget target = new RuleTarget(row.owner().id(), row.groupId());
+            EntityRuleSet rules = updates.getOrDefault(target, row.owner().rulesFor(row.groupId()));
+            if (row.rule().enabled() == enable) {
+                continue;
+            }
+            updates.put(target, rules.withRule(row.rule().withEnabled(enable)));
+            changed++;
+        }
+        this.applyGroupRuleUpdates(updates);
+        this.screen.showStatus(Component.translatable("screen.m4cne.status.claims.rule_toggled",
+                state(enable), changed));
+        this.screen.requestSidebarRebuild();
+    }
+
+    /** Deletes every selected rule from its group. */
+    private void deleteSelectedRules() {
+        List<RuleRow> selected = this.selectedRuleRows(this.ruleRows());
+        ClaimSyncManager sync = ClaimSyncManager.get();
+        java.util.Map<RuleTarget, EntityRuleSet> updates = new java.util.LinkedHashMap<>();
+        int changed = 0;
+        for (RuleRow row : selected) {
+            if (!canEditRules(row.owner(), sync)) {
+                continue;
+            }
+            RuleTarget target = new RuleTarget(row.owner().id(), row.groupId());
+            EntityRuleSet rules = updates.getOrDefault(target, row.owner().rulesFor(row.groupId()));
+            updates.put(target, rules.withoutRule(row.rule().type()));
+            changed++;
+        }
+        this.applyGroupRuleUpdates(updates);
+        this.claimRuleSelection.clear();
+        this.screen.showStatus(
+                Component.translatable("screen.m4cne.status.claims.rule_deleted", changed));
+        this.screen.requestSidebarRebuild();
+    }
+
+    private void applyGroupRuleUpdates(java.util.Map<RuleTarget, EntityRuleSet> updates) {
+        for (java.util.Map.Entry<RuleTarget, EntityRuleSet> entry : updates.entrySet()) {
+            this.applyGroupRules(entry.getKey().ownerId(), entry.getKey().groupId(),
+                    entry.getValue());
+        }
+    }
+
+    /** Applies one rule set of one group locally and uploads it to the server. */
+    private void applyGroupRules(String ownerId, String groupId, EntityRuleSet rules) {
+        if (ownerId == null || groupId == null || rules == null) {
+            return;
+        }
+        ClaimStore.get().setGroupRules(ownerId, groupId, rules);
+        boolean sent = ClaimSyncManager.get().setGroupRules(ownerId, groupId, rules);
+        if (!sent) {
+            this.screen.showStatus(Component.translatable("screen.m4cne.status.claims.unavailable"));
         }
     }
 
     private static Component entityName(String type) {
+        if (EntityRule.PLAYER_TYPE.equals(type)) {
+            return Component.translatable("screen.m4cne.claims.rule_editor.player");
+        }
         ResourceLocation id = ResourceLocation.tryParse(type);
         EntityType<?> entityType = id == null ? null : BuiltInRegistries.ENTITY_TYPE.get(id);
         return entityType == null ? Component.literal(type) : entityType.getDescription();
@@ -1560,15 +1701,6 @@ public final class MapSettingsPanel {
         return grouped;
     }
 
-    private static java.util.Map<String, List<ClaimStore.Entry>> groupByOwner(
-            List<ClaimStore.Entry> entries) {
-        java.util.Map<String, List<ClaimStore.Entry>> grouped = new java.util.LinkedHashMap<>();
-        for (ClaimStore.Entry entry : entries) {
-            grouped.computeIfAbsent(entry.owner().id(), ignored -> new ArrayList<>()).add(entry);
-        }
-        return grouped;
-    }
-
     /** Opens the rename editor for the own selected chunks. */
     private void renameSelectedChunks() {
         List<ClaimStore.Entry> own = this.ownSelectedChunks();
@@ -1732,10 +1864,6 @@ public final class MapSettingsPanel {
             }
         }
         return changed;
-    }
-
-    private ClaimStore.Owner selectedClaimOwner() {
-        return ClaimStore.get().owner(this.selectedClaimOwnerId);
     }
 
     /**

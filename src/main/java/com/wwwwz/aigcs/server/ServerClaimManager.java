@@ -19,6 +19,7 @@ import com.wwwwz.aigcs.AIGCsM4CnE;
 import com.wwwwz.aigcs.Config;
 import com.wwwwz.aigcs.core.claim.ClaimChunk;
 import com.wwwwz.aigcs.core.claim.ClaimOwner;
+import com.wwwwz.aigcs.core.claim.ClaimRuleGroup;
 import com.wwwwz.aigcs.core.claim.EntityRule;
 import com.wwwwz.aigcs.core.claim.EntityRuleSet;
 import com.wwwwz.aigcs.network.ClaimActionPayload;
@@ -61,9 +62,9 @@ import net.neoforged.neoforge.network.PacketDistributor;
 @SuppressWarnings("null")
 public final class ServerClaimManager {
     /**
-     * Entity control settings of one claimed chunk, used by the entity controller.
+     * Entity rules of one claimed chunk, used by the entity controller.
      */
-    public record EntityClaim(String ownerId, boolean forceLoad, EntityRuleSet rules) {
+    public record EntityClaim(String ownerId, String groupId, boolean forceLoad, EntityRuleSet rules) {
     }
 
     /** One chunk with an active entity rule set, used by the cleanup pass. */
@@ -240,6 +241,7 @@ public final class ServerClaimManager {
             }
         }
         owner.claims = claims;
+        this.pruneGroupRules(owner);
         this.dirty = true;
         this.rebuildEntityIndex();
         this.refreshForcedChunks();
@@ -340,29 +342,48 @@ public final class ServerClaimManager {
     }
 
     /**
-     * Applies a new entity control rule set of one owner.
+     * Applies a new entity rule set of one claim group.
      * <p>
      * The server re-checks the permission, drops unknown or non living entity
-     * types and stores the sanitised set. The next authoritative list confirms
-     * the change on every client.
+     * types and stores the sanitised set. The group must belong to one of the
+     * claimed chunk ids of the owner; an empty set removes the group. The next
+     * authoritative list confirms the change on every client.
      */
-    public synchronized void handleEntityRules(ServerPlayer player, String ownerId, EntityRuleSet rules) {
-        if (rules == null || !Config.CLAIM_ENTITY_CONTROL.getAsBoolean()) {
+    public synchronized void handleEntityRules(ServerPlayer player, String ownerId, String groupId,
+            EntityRuleSet rules) {
+        if (!Config.CLAIM_ENTITY_CONTROL.getAsBoolean()) {
             return;
         }
         Owner owner = this.targetOwner(player, ownerId, this.isAdmin(player));
-        if (owner == null) {
+        if (owner == null || groupId == null || groupId.isBlank()) {
+            return;
+        }
+        String group = groupId.trim();
+        if (!this.hasGroup(owner, group)) {
             return;
         }
         int maxRules = Math.max(1, Config.CLAIM_MAX_ENTITY_RULES.getAsInt());
-        owner.entityRules = this.validateRules(rules.sanitize(maxRules));
+        EntityRuleSet sanitized = rules == null ? EntityRuleSet.EMPTY
+                : this.validateRules(rules.sanitize(maxRules));
+        if (sanitized.isEmpty()) {
+            owner.groupRules.remove(group);
+        } else {
+            owner.groupRules.put(group, sanitized);
+        }
         this.changed();
     }
 
-    /** Drops rules whose entity type is unknown or not a living entity. */
+    /** Drops rules whose entity type is unknown or not a living entity / player. */
     private EntityRuleSet validateRules(EntityRuleSet rules) {
         List<EntityRule> kept = new ArrayList<>(rules.rules().size());
         for (EntityRule rule : rules.rules()) {
+            if (rule == null) {
+                continue;
+            }
+            if (EntityRule.PLAYER_TYPE.equals(rule.type())) {
+                kept.add(rule);
+                continue;
+            }
             ResourceLocation id = ResourceLocation.tryParse(rule.type());
             if (id == null || !BuiltInRegistries.ENTITY_TYPE.containsKey(id)) {
                 continue;
@@ -376,14 +397,47 @@ public final class ServerClaimManager {
             }
             kept.add(rule);
         }
-        return new EntityRuleSet(rules.enabled(), rules.allowSpawn(), rules.allowAggro(),
-                rules.allowEnter(), rules.allowLeave(), rules.forceLoadAllowSpawn(), kept);
+        return new EntityRuleSet(kept);
+    }
+
+    /** True when at least one chunk of the owner carries this group id. */
+    private boolean hasGroup(Owner owner, String groupId) {
+        for (Long2ObjectMap<ChunkData> map : owner.claims.values()) {
+            for (Long2ObjectMap.Entry<ChunkData> entry : map.long2ObjectEntrySet()) {
+                long key = entry.getLongKey();
+                if (chunkId(entry.getValue(), ChunkPos.getX(key), ChunkPos.getZ(key)).equals(groupId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Chunk id of one stored chunk, never blank. */
+    private static String chunkId(ChunkData data, int x, int z) {
+        return data.id == null || data.id.isBlank() ? ClaimChunk.defaultId(x, z) : data.id;
+    }
+
+    /** Removes rules of groups that no longer own any chunk. */
+    private void pruneGroupRules(Owner owner) {
+        if (owner.groupRules.isEmpty()) {
+            return;
+        }
+        Set<String> used = new LinkedHashSet<>();
+        for (Long2ObjectMap<ChunkData> map : owner.claims.values()) {
+            for (Long2ObjectMap.Entry<ChunkData> entry : map.long2ObjectEntrySet()) {
+                long key = entry.getLongKey();
+                used.add(chunkId(entry.getValue(), ChunkPos.getX(key), ChunkPos.getZ(key)));
+            }
+        }
+        owner.groupRules.keySet().removeIf(id -> !used.contains(id));
     }
 
     /** Removes either the given chunks or every claim of the owner. */
     private void removeClaims(Owner owner, List<ClaimChunk> chunks, boolean block) {
         if (chunks == null || chunks.isEmpty()) {
             owner.claims.clear();
+            this.pruneGroupRules(owner);
             return;
         }
         long now = System.currentTimeMillis();
@@ -405,6 +459,7 @@ public final class ServerClaimManager {
                         .put(dimension + "#" + key, now + BLOCKED_MILLIS);
             }
         }
+        this.pruneGroupRules(owner);
     }
 
     private void clearForce(Owner owner, List<ClaimChunk> chunks) {
@@ -421,7 +476,10 @@ public final class ServerClaimManager {
         }
     }
 
-    /** Applies a new id to the listed existing chunks of one owner. */
+    /**
+     * Applies a new id to the listed existing chunks of one owner. The rules of
+     * a renamed group follow the new id when the old id disappears.
+     */
     private void renameClaims(Owner owner, List<ClaimChunk> chunks, String id) {
         String newId = id == null ? "" : id.trim();
         if (chunks == null || chunks.isEmpty() || newId.isEmpty()) {
@@ -430,9 +488,22 @@ public final class ServerClaimManager {
         if (newId.length() > ClaimChunk.MAX_ID_LENGTH) {
             newId = newId.substring(0, ClaimChunk.MAX_ID_LENGTH);
         }
+        Set<String> oldIds = new LinkedHashSet<>();
         for (ChunkData data : this.chunkData(owner, chunks)) {
+            oldIds.add(data.id == null || data.id.isBlank() ? newId : data.id);
             data.id = newId;
         }
+        EntityRuleSet inherited = owner.groupRules.get(newId);
+        for (String old : oldIds) {
+            EntityRuleSet removed = owner.groupRules.remove(old);
+            if (inherited == null) {
+                inherited = removed;
+            }
+        }
+        if (inherited != null && !inherited.isEmpty()) {
+            owner.groupRules.put(newId, inherited);
+        }
+        this.pruneGroupRules(owner);
     }
 
     /** Toggles the boundary wall or the enter message flag of some chunks. */
@@ -452,6 +523,12 @@ public final class ServerClaimManager {
     /**
      * Merges the listed chunks into one id: the lexicographically smallest id of
      * the group wins. The chunks do not have to touch each other.
+     * <p>
+     * Only the chunks of one owner reach this method (the action payload is
+     * resolved against a single owner, and non administrators may only target
+     * themselves), so chunks of different players can never be merged. The
+     * merged group only inherits the entity rules of the smallest id; the rules
+     * of every other merged group are dropped (要求补充-15 item 7).
      */
     private void mergeClaims(Owner owner, List<ClaimChunk> chunks) {
         if (chunks == null || chunks.isEmpty()) {
@@ -459,11 +536,13 @@ public final class ServerClaimManager {
         }
         List<ChunkData> data = this.chunkData(owner, chunks);
         String merged = null;
+        Set<String> oldIds = new LinkedHashSet<>();
         for (ChunkData entry : data) {
             String id = entry.id == null || entry.id.isBlank() ? null : entry.id;
             if (id == null) {
                 continue;
             }
+            oldIds.add(id);
             if (merged == null || id.compareTo(merged) < 0) {
                 merged = id;
             }
@@ -471,9 +550,17 @@ public final class ServerClaimManager {
         if (merged == null) {
             return;
         }
+        EntityRuleSet inherited = owner.groupRules.get(merged);
         for (ChunkData entry : data) {
             entry.id = merged;
         }
+        for (String old : oldIds) {
+            owner.groupRules.remove(old);
+        }
+        if (inherited != null && !inherited.isEmpty()) {
+            owner.groupRules.put(merged, inherited);
+        }
+        this.pruneGroupRules(owner);
     }
 
     /** Existing chunk data records of the listed chunks. */
@@ -585,8 +672,15 @@ public final class ServerClaimManager {
                     total++;
                 }
             }
-            list.add(new ClaimOwner(owner.id, owner.name, owner.color, owner.boundary, chunks,
-                    owner.entityRules));
+            List<ClaimRuleGroup> groups = new ArrayList<>(owner.groupRules.size());
+            for (Map.Entry<String, EntityRuleSet> group : owner.groupRules.entrySet()) {
+                if (group.getValue() == null || group.getValue().isEmpty()) {
+                    continue;
+                }
+                groups.add(new ClaimRuleGroup(group.getKey(), group.getValue()));
+            }
+            groups.sort((left, right) -> left.id().compareTo(right.id()));
+            list.add(new ClaimOwner(owner.id, owner.name, owner.color, owner.boundary, chunks, groups));
         }
         return list;
     }
@@ -604,6 +698,7 @@ public final class ServerClaimManager {
             if (owner.name.equalsIgnoreCase(name)) {
                 int removed = owner.count();
                 owner.claims.clear();
+                owner.groupRules.clear();
                 this.changed();
                 return removed;
             }
@@ -651,14 +746,14 @@ public final class ServerClaimManager {
 
     /**
      * Rebuilds the chunk to owner index used by the entity controller. Chunks of
-     * owners that did not enable entity control are left out, so the controller
-     * only pays for claims that actually use the feature.
+     * groups without any rule are left out, so the controller only pays for
+     * claims that actually use the feature.
      */
     private void rebuildEntityIndex() {
         this.entityIndex.clear();
         List<EntityChunk> chunks = new ArrayList<>();
         for (Owner owner : this.owners.values()) {
-            if (owner.entityRules == null || owner.entityRules.inert()) {
+            if (owner.groupRules.isEmpty()) {
                 continue;
             }
             for (Map.Entry<String, Long2ObjectMap<ChunkData>> entry : owner.claims.entrySet()) {
@@ -667,9 +762,15 @@ public final class ServerClaimManager {
                 for (Long2ObjectMap.Entry<ChunkData> chunk : entry.getValue().long2ObjectEntrySet()) {
                     ChunkData data = chunk.getValue();
                     long key = chunk.getLongKey();
-                    map.put(key, new EntityClaim(owner.id, data.forceLoad, owner.entityRules));
-                    chunks.add(new EntityChunk(entry.getKey(), ChunkPos.getX(key), ChunkPos.getZ(key),
-                            data.forceLoad, owner.entityRules));
+                    int x = ChunkPos.getX(key);
+                    int z = ChunkPos.getZ(key);
+                    String groupId = chunkId(data, x, z);
+                    EntityRuleSet rules = owner.groupRules.get(groupId);
+                    if (rules == null || rules.isEmpty()) {
+                        continue;
+                    }
+                    map.put(key, new EntityClaim(owner.id, groupId, data.forceLoad, rules));
+                    chunks.add(new EntityChunk(entry.getKey(), x, z, data.forceLoad, rules));
                 }
             }
         }
@@ -760,7 +861,15 @@ public final class ServerClaimManager {
                 Owner owner = new Owner(entry.id, entry.name == null ? "?" : entry.name);
                 owner.color = entry.color & 0xFFFFFF;
                 owner.boundary = entry.boundary;
-                owner.entityRules = entry.entityRules == null ? EntityRuleSet.DEFAULT : entry.entityRules;
+                if (entry.groups != null) {
+                    for (StoredGroup group : entry.groups) {
+                        if (group == null || group.id == null || group.id.isBlank() || group.rules == null
+                                || group.rules.isEmpty()) {
+                            continue;
+                        }
+                        owner.groupRules.put(group.id, group.rules);
+                    }
+                }
                 if (entry.chunks != null) {
                     for (StoredChunk chunk : entry.chunks) {
                         if (chunk == null || chunk.dimension == null) {
@@ -774,6 +883,7 @@ public final class ServerClaimManager {
                                 ignored -> new Long2ObjectOpenHashMap<>()).put(key, data);
                     }
                 }
+                this.pruneGroupRules(owner);
                 this.owners.put(owner.id, owner);
             }
         } catch (Exception exception) {
@@ -792,7 +902,15 @@ public final class ServerClaimManager {
             entry.name = owner.name;
             entry.color = owner.color;
             entry.boundary = owner.boundary;
-            entry.entityRules = owner.entityRules;
+            for (Map.Entry<String, EntityRuleSet> group : owner.groupRules.entrySet()) {
+                if (group.getValue() == null || group.getValue().isEmpty()) {
+                    continue;
+                }
+                StoredGroup storedGroup = new StoredGroup();
+                storedGroup.id = group.getKey();
+                storedGroup.rules = group.getValue();
+                entry.groups.add(storedGroup);
+            }
             for (Map.Entry<String, Long2ObjectMap<ChunkData>> chunkEntry : owner.claims.entrySet()) {
                 for (Long2ObjectMap.Entry<ChunkData> mapEntry : chunkEntry.getValue().long2ObjectEntrySet()) {
                     long key = mapEntry.getLongKey();
@@ -825,7 +943,8 @@ public final class ServerClaimManager {
         private String name;
         private int color = 0xFFFFFF;
         private boolean boundary = true;
-        private EntityRuleSet entityRules = EntityRuleSet.DEFAULT;
+        /** Entity rules keyed by chunk id (claim group). */
+        private final Map<String, EntityRuleSet> groupRules = new LinkedHashMap<>();
         private Map<String, Long2ObjectMap<ChunkData>> claims = new LinkedHashMap<>();
 
         private Owner(String id, String name) {
@@ -889,9 +1008,15 @@ public final class ServerClaimManager {
         private String id;
         private String name;
         private int color = 0xFFFFFF;
-        private EntityRuleSet entityRules = EntityRuleSet.DEFAULT;
         private boolean boundary = true;
+        private List<StoredGroup> groups = new ArrayList<>();
         private List<StoredChunk> chunks = new ArrayList<>();
+    }
+
+    /** Entity rules of one claim group persisted in {@code claims.json}. */
+    private static final class StoredGroup {
+        private String id;
+        private EntityRuleSet rules = EntityRuleSet.EMPTY;
     }
 
     private static final class StoredChunk {

@@ -222,9 +222,10 @@ public final class ClaimSyncManager {
                 false, 0, "", chunks == null ? List.of() : chunks));
     }
 
-    /** Replaces the entity control rules of one owner (owner or administrator). */
-    public boolean setEntityRules(String ownerId, EntityRuleSet rules) {
-        return this.send(new ClaimRulePayload(ownerId == null ? "" : ownerId, rules));
+    /** Replaces the entity rules of one claim group (owner or administrator). */
+    public boolean setGroupRules(String ownerId, String groupId, EntityRuleSet rules) {
+        return this.send(new ClaimRulePayload(ownerId == null ? "" : ownerId,
+                groupId == null ? "" : groupId, rules));
     }
 
     private boolean send(CustomPacketPayload payload) {

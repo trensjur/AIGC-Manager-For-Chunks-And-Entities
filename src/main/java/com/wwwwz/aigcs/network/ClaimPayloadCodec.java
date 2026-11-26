@@ -7,6 +7,7 @@ import java.util.Map;
 
 import com.wwwwz.aigcs.core.claim.ClaimChunk;
 import com.wwwwz.aigcs.core.claim.ClaimOwner;
+import com.wwwwz.aigcs.core.claim.ClaimRuleGroup;
 import com.wwwwz.aigcs.core.claim.EntityRule;
 import com.wwwwz.aigcs.core.claim.EntityRuleSet;
 
@@ -27,8 +28,12 @@ public final class ClaimPayloadCodec {
     public static final int MAX_DIMENSIONS = 64;
     /** Upper bound of an entity type id written inside a rule. */
     public static final int MAX_ENTITY_TYPE_LENGTH = 128;
+    /** Upper bound of a mob effect id written inside a rule. */
+    public static final int MAX_BUFF_ID_LENGTH = 96;
     /** Upper bound of rules transferred in one rule set. */
     public static final int MAX_RULES_PER_SET = 256;
+    /** Upper bound of rule groups transferred for one claim owner. */
+    public static final int MAX_RULE_GROUPS = 256;
     /** Upper bound of chunks inside one C2S batch. */
     public static final int MAX_CHUNKS_PER_PAYLOAD = 4096;
     /** Upper bound of chunks of one owner inside an S2C list. */
@@ -98,45 +103,80 @@ public final class ClaimPayloadCodec {
         return chunks;
     }
 
-    /** Writes the entity control rules of one claim owner. */
+    /** Writes the entity rules of one chunk group. */
     public static void writeRuleSet(RegistryFriendlyByteBuf buffer, EntityRuleSet ruleSet) {
-        EntityRuleSet rules = ruleSet == null ? EntityRuleSet.DEFAULT : ruleSet;
-        buffer.writeBoolean(rules.enabled());
-        buffer.writeBoolean(rules.allowSpawn());
-        buffer.writeBoolean(rules.allowAggro());
-        buffer.writeBoolean(rules.allowEnter());
-        buffer.writeBoolean(rules.allowLeave());
-        buffer.writeBoolean(rules.forceLoadAllowSpawn());
+        EntityRuleSet rules = ruleSet == null ? EntityRuleSet.EMPTY : ruleSet;
         List<EntityRule> list = rules.rules();
         int count = Math.min(list.size(), Math.min(MAX_RULES_PER_SET, EntityRuleSet.MAX_RULES));
         buffer.writeVarInt(count);
         for (int position = 0; position < count; position++) {
             EntityRule rule = list.get(position);
             buffer.writeUtf(rule.type(), MAX_ENTITY_TYPE_LENGTH);
+            int flags = 0;
+            if (rule.enabled()) {
+                flags |= 1;
+            }
+            if (rule.allowNaturalSpawn()) {
+                flags |= 2;
+            }
+            if (rule.allowUnnaturalSpawn()) {
+                flags |= 4;
+            }
+            if (rule.allowAggro()) {
+                flags |= 8;
+            }
+            if (rule.isolated()) {
+                flags |= 16;
+            }
+            buffer.writeByte(flags);
             buffer.writeVarInt(rule.maxCount());
-            buffer.writeBoolean(rule.allowSpawn());
-            buffer.writeBoolean(rule.allowAggro());
+            List<String> buffs = rule.buffs();
+            int buffCount = Math.min(buffs.size(), EntityRule.MAX_BUFFS);
+            buffer.writeVarInt(buffCount);
+            for (int index = 0; index < buffCount; index++) {
+                buffer.writeUtf(buffs.get(index), MAX_BUFF_ID_LENGTH);
+            }
         }
     }
 
     public static EntityRuleSet readRuleSet(RegistryFriendlyByteBuf buffer) {
-        boolean enabled = buffer.readBoolean();
-        boolean allowSpawn = buffer.readBoolean();
-        boolean allowAggro = buffer.readBoolean();
-        boolean allowEnter = buffer.readBoolean();
-        boolean allowLeave = buffer.readBoolean();
-        boolean forceLoadAllowSpawn = buffer.readBoolean();
         int count = Math.min(buffer.readVarInt(), MAX_RULES_PER_SET);
         List<EntityRule> rules = new ArrayList<>(count);
         for (int position = 0; position < count; position++) {
             String type = buffer.readUtf(MAX_ENTITY_TYPE_LENGTH);
+            int flags = buffer.readByte() & 0xFF;
             int maxCount = buffer.readVarInt();
-            boolean ruleAllowSpawn = buffer.readBoolean();
-            boolean ruleAllowAggro = buffer.readBoolean();
-            rules.add(new EntityRule(type, maxCount, ruleAllowSpawn, ruleAllowAggro));
+            int buffCount = Math.min(buffer.readVarInt(), EntityRule.MAX_BUFFS);
+            List<String> buffs = new ArrayList<>(buffCount);
+            for (int index = 0; index < buffCount; index++) {
+                buffs.add(buffer.readUtf(MAX_BUFF_ID_LENGTH));
+            }
+            rules.add(new EntityRule(type, (flags & 1) != 0, maxCount, (flags & 2) != 0,
+                    (flags & 4) != 0, (flags & 8) != 0, (flags & 16) != 0, buffs));
         }
-        return new EntityRuleSet(enabled, allowSpawn, allowAggro, allowEnter, allowLeave,
-                forceLoadAllowSpawn, rules);
+        return new EntityRuleSet(rules);
+    }
+
+    /** Writes the rule groups (chunk id + rules) of one claim owner. */
+    public static void writeRuleGroups(RegistryFriendlyByteBuf buffer, List<ClaimRuleGroup> groups) {
+        List<ClaimRuleGroup> list = groups == null ? List.of() : groups;
+        int count = Math.min(list.size(), MAX_RULE_GROUPS);
+        buffer.writeVarInt(count);
+        for (int position = 0; position < count; position++) {
+            ClaimRuleGroup group = list.get(position);
+            buffer.writeUtf(group.id(), ClaimChunk.MAX_ID_LENGTH);
+            writeRuleSet(buffer, group.rules());
+        }
+    }
+
+    public static List<ClaimRuleGroup> readRuleGroups(RegistryFriendlyByteBuf buffer) {
+        int count = Math.min(buffer.readVarInt(), MAX_RULE_GROUPS);
+        List<ClaimRuleGroup> groups = new ArrayList<>(count);
+        for (int position = 0; position < count; position++) {
+            String id = buffer.readUtf(ClaimChunk.MAX_ID_LENGTH);
+            groups.add(new ClaimRuleGroup(id, readRuleSet(buffer)));
+        }
+        return groups;
     }
 
     public static void writeOwners(RegistryFriendlyByteBuf buffer, List<ClaimOwner> owners) {
@@ -168,7 +208,7 @@ public final class ClaimPayloadCodec {
             buffer.writeUtf(data.name() == null ? "" : data.name(), MAX_NAME_LENGTH);
             buffer.writeInt(data.color());
             buffer.writeBoolean(data.boundary());
-            writeRuleSet(buffer, data.entityRules());
+            writeRuleGroups(buffer, data.ruleGroups());
             List<ClaimChunk> list = chunks.get(owner);
             buffer.writeVarInt(list.size());
             for (ClaimChunk chunk : list) {
@@ -196,7 +236,7 @@ public final class ClaimPayloadCodec {
             String name = buffer.readUtf(MAX_NAME_LENGTH);
             int color = buffer.readInt();
             boolean boundary = buffer.readBoolean();
-            EntityRuleSet entityRules = readRuleSet(buffer);
+            List<ClaimRuleGroup> ruleGroups = readRuleGroups(buffer);
             int count = Math.min(buffer.readVarInt(), MAX_CHUNKS_PER_OWNER);
             List<ClaimChunk> chunks = new ArrayList<>(count);
             for (int position = 0; position < count; position++) {
@@ -212,7 +252,7 @@ public final class ClaimPayloadCodec {
                             chunkBoundary, enterMessage));
                 }
             }
-            owners.add(new ClaimOwner(id, name, color, boundary, chunks, entityRules));
+            owners.add(new ClaimOwner(id, name, color, boundary, chunks, ruleGroups));
         }
         return owners;
     }

@@ -53,6 +53,8 @@ public class AIGCsM4CnE {
         NeoForge.EVENT_BUS.addListener(ServerEntityControl::onServerTick);
         NeoForge.EVENT_BUS.addListener(ServerEntityControl::onServerStopping);
         NeoForge.EVENT_BUS.addListener(ServerEntityControl::onEntityJoin);
+        NeoForge.EVENT_BUS.addListener(ServerEntityControl::onFinalizeSpawn);
+        NeoForge.EVENT_BUS.addListener(ServerEntityControl::onEntityLeaveLevel);
         NeoForge.EVENT_BUS.addListener(ServerEntityControl::onLivingChangeTarget);
         NeoForge.EVENT_BUS.addListener(ServerEntityControl::onEntityTick);
         NeoForge.EVENT_BUS.addListener(M4CnECommand::register);
